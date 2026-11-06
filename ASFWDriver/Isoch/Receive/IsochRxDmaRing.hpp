@@ -7,6 +7,9 @@
 #include "../../Shared/Rings/BufferRing.hpp"
 #include "../../Hardware/OHCIDescriptors.hpp"
 #include "../../Common/BarrierUtils.hpp"
+#include "../../Shared/Memory/UncachedFill.hpp"
+
+#include <array>
 
 #include <cstddef>
 #include <cstdint>
@@ -22,8 +25,14 @@ public:
         uint16_t xferStatus{0};
         uint16_t resCount{0};
         uint16_t actualLength{0};
+        /// The received bytes, copied out of the (uncached) DMA buffer into
+        /// the ring's staging buffer. Valid only during the handler call.
         const uint8_t* payload{nullptr};
     };
+
+    /// Largest payload staged in cached memory: an S800 isochronous packet.
+    /// A longer one (never configured) is handed over in place.
+    static constexpr size_t kStagingBytes = 4096;
 
     [[nodiscard]] kern_return_t SetupRings(Memory::IIsochDMAMemory& dma,
                                           size_t numDescriptors,
@@ -64,8 +73,14 @@ public:
 
             const uint16_t actualLength = (resCount <= reqCount) ? static_cast<uint16_t>(reqCount - resCount) : 0;
             auto* payloadVA = bufferRing_.GetElementVA(idx);
+            const uint8_t* payload = payloadVA;
             if (payloadVA && actualLength > 0) {
                 dma.FetchFromDevice(payloadVA, actualLength);
+                // Read the DMA buffer once; the handler parses the copy.
+                if (actualLength <= staging_.size()) {
+                    ::ASFW::Shared::CopyFromUncachedDma(staging_.data(), payloadVA, actualLength);
+                    payload = staging_.data();
+                }
             }
 
             CompletedPacket packet{
@@ -73,7 +88,7 @@ public:
                 .xferStatus = xferStatus,
                 .resCount = resCount,
                 .actualLength = actualLength,
-                .payload = payloadVA,
+                .payload = payload,
             };
             onPacket(packet);
 
@@ -107,6 +122,7 @@ private:
     Shared::BufferRing bufferRing_{};
     size_t maxPacketSizeBytes_{0};
     uint32_t lastProcessedIndex_{0};
+    alignas(16) std::array<uint8_t, kStagingBytes> staging_{};
 };
 
 } // namespace ASFW::Isoch::Rx

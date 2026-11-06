@@ -5,6 +5,9 @@
 #include "Hardware/HardwareInterface.hpp"
 
 #include "Hardware/OHCIDescriptors.hpp"
+#include "Shared/Memory/UncachedFill.hpp"
+
+#include <cstring>
 
 using namespace ASFW::Isoch;
 using namespace ASFW::Isoch::Rx;
@@ -85,4 +88,71 @@ TEST(IsochRxDmaRingTests, DrainCompleted_ProcessesOneDescriptorAndRearms) {
     mem->FetchFromDevice(d0, sizeof(*d0));
     EXPECT_EQ(ASFW::Async::HW::AR_xferStatus(*d0), 0u);
     EXPECT_EQ(ASFW::Async::HW::AR_resCount(*d0), reqCount);
+}
+
+TEST(IsochRxDmaRingTests, DrainCompleted_HandsOverACachedCopyOfThePayload) {
+    ::ASFW::Driver::HardwareInterface hw;
+    auto mem = MakeTestIsochMemory(hw, 8, 64);
+    ASSERT_TRUE(mem);
+
+    IsochRxDmaRing ring;
+    ASSERT_EQ(ring.SetupRings(*mem, 8, 64), kIOReturnSuccess);
+
+    auto* d0 = ring.DescriptorAt(0);
+    auto* d1 = ring.DescriptorAt(1);
+    ASSERT_NE(d0, nullptr);
+    ASSERT_NE(d1, nullptr);
+
+    constexpr uint16_t reqCount = 64;
+    // 40 bytes: two 16-byte loads, then quadlets. 7 bytes: no wide load.
+    constexpr uint16_t lengths[2] = {40, 7};
+    for (uint32_t p = 0; p < 2; ++p) {
+        uint8_t* dmaPayload = ring.PayloadVA(p);
+        ASSERT_NE(dmaPayload, nullptr);
+        for (uint32_t i = 0; i < reqCount; ++i) {
+            dmaPayload[i] = static_cast<uint8_t>(0x40 * p + i + 1);
+        }
+    }
+    d0->statusWord = static_cast<uint16_t>(reqCount - lengths[0]);
+    d1->statusWord = static_cast<uint16_t>(reqCount - lengths[1]);
+
+    uint32_t calls = 0;
+    const uint32_t processed =
+        ring.DrainCompleted(*mem, [&](const IsochRxDmaRing::CompletedPacket& pkt) {
+            const uint32_t p = pkt.descriptorIndex;
+            ASSERT_LT(p, 2u);
+            ++calls;
+            ASSERT_EQ(pkt.actualLength, lengths[p]);
+            ASSERT_NE(pkt.payload, nullptr);
+            // A copy, not the DMA buffer the controller writes next time round.
+            EXPECT_NE(pkt.payload, ring.PayloadVA(p));
+            for (uint32_t i = 0; i < pkt.actualLength; ++i) {
+                EXPECT_EQ(pkt.payload[i], static_cast<uint8_t>(0x40 * p + i + 1)) << "byte " << i;
+            }
+        });
+
+    EXPECT_EQ(processed, 2u);
+    EXPECT_EQ(calls, 2u);
+}
+
+TEST(IsochRxDmaRingTests, CopyFromUncachedDma_CopiesExactlyTheRequestedBytesAtAnyAlignment) {
+    alignas(16) uint8_t source[80];
+    for (uint32_t i = 0; i < sizeof(source); ++i) {
+        source[i] = static_cast<uint8_t>(i * 7 + 3);
+    }
+    for (size_t offset : {0u, 1u, 2u, 4u, 8u}) {
+        for (size_t length : {0u, 1u, 3u, 4u, 15u, 16u, 17u, 33u, 64u}) {
+            uint8_t destination[80];
+            std::memset(destination, 0xEE, sizeof(destination));
+            ::ASFW::Shared::CopyFromUncachedDma(destination, source + offset, length);
+            for (size_t i = 0; i < length; ++i) {
+                ASSERT_EQ(destination[i], source[offset + i])
+                    << "offset " << offset << " length " << length << " byte " << i;
+            }
+            for (size_t i = length; i < sizeof(destination); ++i) {
+                ASSERT_EQ(destination[i], 0xEE)
+                    << "wrote past the end: offset " << offset << " length " << length;
+            }
+        }
+    }
 }
