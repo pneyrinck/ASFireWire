@@ -12,6 +12,7 @@
 #include "AvcVolumeMapping.hpp"
 #include "../Wire/AMDTP/PcmSlotMap.hpp"
 #include "../Runtime/ResolvedAudioConfiguration.hpp"
+#include "../../Midi/Capabilities/MidiWireLayout.hpp"
 
 #include <DriverKit/OSArray.h>
 #include <DriverKit/OSBoolean.h>
@@ -96,6 +97,9 @@ struct ASFWAudioDevice {
     /// audio side must offer exactly them, not a profile's list; see
     /// PropertyKeys::kDeviceSampleRates.
     bool deviceSampleRates{false};
+    /// MIDI layout a family declares itself (format, slot, ports, entities).
+    /// Read only by MIDI publication; not published to the audio driver.
+    ::ASFW::Midi::MidiWireLayout midiLayout{};
 
     // Populate properties consumed by ASFWAudioDriver.
     // Returns false only if required objects could not be created.

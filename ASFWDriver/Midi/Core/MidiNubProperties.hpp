@@ -60,6 +60,12 @@ inline constexpr const char* kDestinationStreamIndex = "ASFWMidiDestinationStrea
 /// Whether the port rotation counts from the packet's DBC. One flag for the
 /// endpoint: it is a device-family property, not a per-direction one.
 inline constexpr const char* kDbcAligned = "ASFWMidiDbcAligned";
+/// Optional entity layout: an array of dictionaries, one per CoreMIDI entity.
+/// Absent = one entity per port index.
+inline constexpr const char* kEntityLayout = "ASFWMidiEntityLayout";
+inline constexpr const char* kEntityName = "Name";
+inline constexpr const char* kEntitySourcePort = "SourcePort";
+inline constexpr const char* kEntityDestinationPort = "DestinationPort";
 
 /// Entities CoreMIDI should publish for these capabilities.
 ///

@@ -33,6 +33,15 @@ inline constexpr uint8_t kMpxMidiPorts = 8;
 inline constexpr uint8_t kMpxMidiLabelBase = 0x80;
 inline constexpr uint8_t kMpxMidiMaxBytesPerQuadlet = 3;
 
+/// How MIDI bytes are laid into the MIDI slot. Selects the codec at the
+/// receive packet processor and the transmit composer.
+enum class MidiWireFormat : uint8_t {
+    /// IEC 61883-6 MPX-MIDI (labels 0x80..0x83, ports by DBC).
+    kAm824Mpx = 0,
+    /// Digi 002 / 003 (Audio/Wire/Digi00x/Digi00xMidi.hpp).
+    kDigi00x = 1,
+};
+
 /// Geometry needed to find and interpret the MIDI slot.
 struct MpxMidiGeometry final {
     /// AM824 slots per data block (the CIP DBS).
@@ -47,6 +56,8 @@ struct MpxMidiGeometry final {
     /// Default true: Focusrite implements no unaligned path, and Linux applies
     /// its CIP_UNALIGHED_DBC quirk only to named device families.
     bool dbcAligned{true};
+    /// The byte format in the slot.
+    MidiWireFormat format{MidiWireFormat::kAm824Mpx};
 
     [[nodiscard]] constexpr bool Valid() const noexcept {
         return dbs > 0 && midiSlotIndex < dbs && portCount > 0 &&

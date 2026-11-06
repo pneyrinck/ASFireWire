@@ -1,5 +1,6 @@
 #include "RxAudioPacketProcessor.hpp"
 #include "DirectRxPacketDecoder.hpp"
+#include "../../../Wire/Digi00x/Digi00xMidi.hpp"
 #include "../../../Wire/CIP/CIPHeader.hpp"
 #include "../../../../Isoch/Receive/IsochRxTiming.hpp"
 #include "../../../Ports/IWirePayloadCodec.hpp"
@@ -143,9 +144,15 @@ RxAudioPacketProcessorResult RxAudioPacketProcessor::ProcessPacket(
                               result.receiveCycleTimestamp, midi.drainCycleTimer,
                               midi.drainHostTicks)
                         : midi.drainHostTicks;
-                ASFW::Encoding::DemuxMpxMidi(data, static_cast<uint32_t>(eventCount),
-                                             result.dbc, midi.geometry, packetHostTicks,
-                                             *midi.sink, counters);
+                if (midi.geometry.format == ASFW::Encoding::MidiWireFormat::kDigi00x) {
+                    ASFW::Encoding::Digi00x::DemuxMidi(
+                        data, static_cast<uint32_t>(eventCount), result.dbc,
+                        midi.geometry, packetHostTicks, *midi.sink, counters);
+                } else {
+                    ASFW::Encoding::DemuxMpxMidi(data, static_cast<uint32_t>(eventCount),
+                                                 result.dbc, midi.geometry, packetHostTicks,
+                                                 *midi.sink, counters);
+                }
                 result.midiBytesDelivered =
                     static_cast<uint32_t>(counters.bytesDelivered - before);
             } else {

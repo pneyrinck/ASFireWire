@@ -36,6 +36,29 @@ void FillStreams(const std::vector<ASFW::Audio::Model::ASFWAudioWireStream>& str
 
 MidiEndpointCapabilities MidiEndpointPublication::Project(
     const uint64_t guid, const ASFW::Audio::Model::ASFWAudioDevice& description) noexcept {
+    if (description.midiLayout.present) {
+        // The family states its own MIDI layout instead of deriving it from the
+        // stream formation. Check it against stream 0 of each direction.
+        ASFW::Audio::AudioStreamWireInfo d2h{};
+        ASFW::Audio::AudioStreamWireInfo h2d{};
+        uint64_t d2hPcm = 0;
+        uint64_t h2dPcm = 0;
+        const auto fill = [](const std::vector<ASFW::Audio::Model::ASFWAudioWireStream>& streams,
+                             ASFW::Audio::AudioStreamWireInfo& info, uint64_t& pcmSlots) {
+            if (streams.empty()) return;
+            const auto& stream = streams.front();
+            info.pcmChannels = static_cast<uint16_t>(stream.pcmChannels);
+            info.am824Slots = static_cast<uint16_t>(stream.am824Slots);
+            for (uint32_t c = 0; c < stream.pcmChannels; ++c) {
+                const uint32_t slot = stream.pcmSlotMap.SlotFor(c);
+                if (slot < 64) pcmSlots |= uint64_t{1} << slot;
+            }
+        };
+        fill(description.captureStreams, d2h, d2hPcm);
+        fill(description.playbackStreams, h2d, h2dPcm);
+        return ProjectDeclaredMidiCapabilities(description.midiLayout, d2h, h2d, d2hPcm, h2dPcm,
+                                               guid);
+    }
     ASFW::Audio::AudioStreamRuntimeCaps caps{};
     FillStreams(description.captureStreams, caps.deviceToHostStreams, caps.deviceToHostStreamCount);
     FillStreams(description.playbackStreams, caps.hostToDeviceStreams, caps.hostToDeviceStreamCount);
@@ -47,8 +70,13 @@ MidiEndpointCapabilities MidiEndpointPublication::Project(
 void MidiEndpointPublication::OnEndpointPublished(
     const uint64_t guid, const ASFW::Audio::AudioBackendKind kind,
     const ASFW::Audio::Model::ASFWAudioDevice& description) noexcept {
-    // Family gate: the MIDI geometry comes from DICE's stream-format registers.
-    if (kind != ASFW::Audio::AudioBackendKind::Dice) return;
+    // Family gate: DICE's MIDI geometry comes from its stream-format registers;
+    // Digi00x declares its own layout. Other families' declared MIDI ports are
+    // not trusted for publication yet.
+    if (kind != ASFW::Audio::AudioBackendKind::Dice &&
+        kind != ASFW::Audio::AudioBackendKind::Digi00xRegister) {
+        return;
+    }
 
     const MidiEndpointCapabilities caps = Project(guid, description);
     if (!caps.AnyUsable()) {

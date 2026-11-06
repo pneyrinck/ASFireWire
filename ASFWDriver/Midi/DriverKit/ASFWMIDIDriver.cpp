@@ -163,7 +163,8 @@ kern_return_t IMPL(ASFWMIDIDriver, Start) {
     if (!ivars->device) return kIOReturnNoMemory;
 
     if (!ivars->device->init(this, deviceName.get(), modelUID.get(),
-                             manufacturerUID.get(), sourcePorts, destinationPorts)) {
+                             manufacturerUID.get(), sourcePorts, destinationPorts,
+                             OSDynamicCast(OSArray, properties->getObject(Keys::kEntityLayout)))) {
         ASFW_LOG_ERROR(Midi, "ASFWMIDIDriver: device init failed");
         ivars->device.reset();
         return kIOReturnNoMemory;

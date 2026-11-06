@@ -19,6 +19,7 @@
 #include "../Protocols/IDeviceProtocol.hpp"
 #include "../Protocols/Digi00x/Digi00xFamilyDriver.hpp"
 #include "../Protocols/Digi00x/Digi00xRegisters.hpp"
+#include "../Wire/Digi00x/Digi00xMidi.hpp"
 #include "../Wire/Digi00x/Digi00xSlotLayout.hpp"
 #include "../../DeviceProfiles/Audio/AudioDeviceCatalog.hpp"
 
@@ -39,7 +40,12 @@ public:
             done(DescribeRefusal{kIOReturnNotReady, "no-protocol"});
             return;
         }
-        done(BuildNubConfig(in.record, in.policy->plan.profileBuilder, in.protocol->GetName()));
+        bool console = false;
+        for (const auto id : in.policy->plan.candidates) {
+            console = console || id == DeviceProfiles::Audio::DeviceDefinitionId::Digi00xConsole;
+        }
+        done(BuildNubConfig(in.record, in.policy->plan.profileBuilder, in.protocol->GetName(),
+                            console));
     }
 
     [[nodiscard]] bool ActsOn(DuplexRestartReason reason) const noexcept override {
@@ -63,7 +69,7 @@ public:
     [[nodiscard]] static Model::ASFWAudioDevice BuildNubConfig(
         const Discovery::DeviceRecord& record,
         DeviceProfiles::Audio::ProfileBuilderId builder,
-        const char* name) {
+        const char* name, bool console = false) {
         constexpr uint32_t kRate = Digi00x::kDefaultStreamedRateHz;
         const uint32_t pcm = Digi00x::PcmChannelsForRate(kRate).value_or(0);
         const uint32_t slots = Digi00x::DataBlockQuadletsForRate(kRate).value_or(0);
@@ -88,6 +94,23 @@ public:
         config.playbackStreams.push_back({.pcmChannels = pcm, .am824Slots = slots, .midiPorts = 0,
                                           .channelOffset = 0, .pcmSlotMap = pcmAfterMidi});
         config.resolvedGeometryRequired = true;
+
+        // MIDI rides in data channel 0 in the device's own format
+        // (Digi00xMidi.hpp). Declared here, not as stream midiPorts, which
+        // the audio path reads as IEC 61883-6 MIDI slots. Every model has
+        // MIDI in 1 and MIDI out 1 + 2; a Console adds its control port.
+        namespace Dg = ::ASFW::Encoding::Digi00x;
+        auto& midi = config.midiLayout;
+        midi.present = true;
+        midi.format = ::ASFW::Encoding::MidiWireFormat::kDigi00x;
+        midi.slotIndex = static_cast<uint8_t>(Dg::kMidiDataChannel);
+        midi.sourcePorts = console ? Dg::kMidiPortSlots : 1;
+        midi.destinationPorts = console ? Dg::kMidiPortSlots : 2;
+        (void)midi.entities.Add("MIDI 1", Dg::kMidiPort1, Dg::kMidiPort1);
+        (void)midi.entities.Add("MIDI 2", ::ASFW::Midi::kNoMidiPort, Dg::kMidiPort2);
+        if (console) {
+            (void)midi.entities.Add("Control", Dg::kControlPort, Dg::kControlPort);
+        }
         return config;
     }
 };

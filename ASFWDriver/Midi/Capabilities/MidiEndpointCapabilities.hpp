@@ -23,6 +23,7 @@
 #include <cstdint>
 
 #include "../../Audio/Protocols/AudioTypes.hpp"
+#include "MidiWireLayout.hpp"
 
 namespace ASFW::Midi {
 
@@ -102,6 +103,8 @@ struct MidiDirectionCapabilities final {
     /// the CIP_UNALIGHED_DBC quirk only to specific families. Make it false
     /// only with a reference that names the device.
     bool dbcAligned{true};
+    /// The byte format in the MIDI slot.
+    ::ASFW::Encoding::MidiWireFormat format{::ASFW::Encoding::MidiWireFormat::kAm824Mpx};
 
     [[nodiscard]] constexpr bool Usable() const noexcept {
         return status == MidiCapabilityStatus::kOk && portCount > 0;
@@ -123,6 +126,8 @@ struct MidiEndpointCapabilities final {
     uint64_t guid{0};
     /// Invalidates outstanding reservations and parser state on restart.
     uint64_t streamEpoch{0};
+    /// CoreMIDI entity layout; empty = one entity per port index.
+    MidiEntityTable entities{};
 
     [[nodiscard]] constexpr bool AnyUsable() const noexcept {
         return deviceToHost.Usable() || hostToDevice.Usable();
@@ -164,5 +169,15 @@ enum class MidiDirection : uint8_t {
     const ASFW::Audio::AudioStreamRuntimeCaps& caps,
     uint64_t guid,
     uint64_t streamEpoch) noexcept;
+
+/// Project a family-declared layout (MidiWireLayout) against stream 0's wire
+/// shape: the MIDI slot must lie inside the data block and outside the PCM
+/// slots `pcmSlots` lists.
+[[nodiscard]] MidiEndpointCapabilities ProjectDeclaredMidiCapabilities(
+    const MidiWireLayout& layout,
+    const ASFW::Audio::AudioStreamWireInfo& deviceToHost,
+    const ASFW::Audio::AudioStreamWireInfo& hostToDevice,
+    uint64_t pcmSlotsDeviceToHost, uint64_t pcmSlotsHostToDevice,
+    uint64_t guid) noexcept;
 
 } // namespace ASFW::Midi

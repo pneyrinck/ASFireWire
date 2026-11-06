@@ -51,6 +51,7 @@
 #include <cstdint>
 
 #include "../../../Wire/AM824/MpxMidiMux.hpp"
+#include "../../../Wire/Digi00x/Digi00xMidi.hpp"
 #include "../../../Wire/AMDTP/AmdtpPacketTimeline.hpp"
 #include "../../../../Midi/Transport/MidiTransportBlock.hpp"
 #include "../../../../Midi/Transport/MidiTxReservation.hpp"
@@ -179,7 +180,7 @@ public:
             const uint8_t dbc = slot->packetBytes.load(std::memory_order_relaxed)[3];
             ASFW::Midi::MidiPacketReservation reservation{};
             if (!scope_.Begin(*block, epoch, static_cast<uint32_t>(packet), reservation,
-                              ASFW::Encoding::MpxMidiPortsInPacket(blocks, dbc, config_.geometry))) {
+                              PortsInPacket(blocks, dbc))) {
                 break;
             }
             if (reservation.Any()) {
@@ -188,9 +189,15 @@ public:
                     bytes.hasByteForPort[port] = reservation.hasByteForPort[port];
                     bytes.byteForPort[port] = reservation.byteForPort[port];
                 }
-                ASFW::Encoding::WriteMpxMidiSlot(
-                    slot->packetBytes.load(std::memory_order_relaxed) + kCipHeaderBytes, blocks, dbc,
-                    config_.geometry, bytes);
+                uint8_t* payload =
+                    slot->packetBytes.load(std::memory_order_relaxed) + kCipHeaderBytes;
+                if (config_.geometry.format == ASFW::Encoding::MidiWireFormat::kDigi00x) {
+                    ASFW::Encoding::Digi00x::WriteMidiSlot(payload, blocks, dbc,
+                                                           config_.geometry, bytes);
+                } else {
+                    ASFW::Encoding::WriteMpxMidiSlot(payload, blocks, dbc, config_.geometry,
+                                                     bytes);
+                }
                 for (uint32_t port = 0; port < ASFW::Encoding::kMpxMidiPorts; ++port) {
                     if (bytes.hasByteForPort[port]) ++result.bytesComposed;
                 }
@@ -212,6 +219,13 @@ public:
     }
 
     [[nodiscard]] uint64_t Cursor() const noexcept { return cursor_; }
+
+    /// The ports the configured wire format can carry in this packet.
+    [[nodiscard]] uint32_t PortsInPacket(uint32_t blocks, uint8_t dbc) const noexcept {
+        return config_.geometry.format == ASFW::Encoding::MidiWireFormat::kDigi00x
+                   ? ASFW::Encoding::Digi00x::PortsInPacket(blocks, dbc, config_.geometry)
+                   : ASFW::Encoding::MpxMidiPortsInPacket(blocks, dbc, config_.geometry);
+    }
     [[nodiscard]] const MidiTxComposerCounters& Counters() const noexcept { return counters_; }
     [[nodiscard]] const ASFW::Midi::MidiReservationCounters& ReservationCounters() const noexcept {
         return scope_.Counters();

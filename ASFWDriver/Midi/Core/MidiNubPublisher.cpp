@@ -8,6 +8,7 @@
 #include <DriverKit/DriverKit.h>
 #include <DriverKit/IOLib.h>
 #include <DriverKit/IOService.h>
+#include <DriverKit/OSArray.h>
 #include <DriverKit/OSBoolean.h>
 #include <DriverKit/OSDictionary.h>
 #include <DriverKit/OSNumber.h>
@@ -34,6 +35,23 @@ void SetString(OSDictionary* properties, const char* key, const char* value) {
     if (value == nullptr) return;
     auto text = OSSharedPtr(OSString::withCString(value), OSNoRetain);
     if (text) properties->setObject(key, text.get());
+}
+
+/// The family's entity table, if it gave one (see NubKeys::kEntityLayout).
+void SetEntityLayout(OSDictionary* properties, const MidiEntityTable& table) {
+    if (table.count == 0) return;
+    auto array = OSSharedPtr(OSArray::withCapacity(table.count), OSNoRetain);
+    if (!array) return;
+    for (uint32_t i = 0; i < table.count; ++i) {
+        const auto& entity = table.entities[i];
+        auto entry = OSSharedPtr(OSDictionary::withCapacity(3), OSNoRetain);
+        if (!entry) return;
+        SetString(entry.get(), Keys::kEntityName, entity.name.data());
+        SetNumber(entry.get(), Keys::kEntitySourcePort, entity.sourcePort, 32);
+        SetNumber(entry.get(), Keys::kEntityDestinationPort, entity.destinationPort, 32);
+        array->setObject(entry.get());
+    }
+    properties->setObject(Keys::kEntityLayout, array.get());
 }
 
 void SetBool(OSDictionary* properties, const char* key, bool value) {
@@ -169,6 +187,7 @@ bool MidiNubPublisher::EnsureNub(const MidiEndpointCapabilities& caps,
     SetNumber(properties.get(), Keys::kDestinationDbs, destination.dbs, 32);
     SetNumber(properties.get(), Keys::kDestinationStreamIndex, destination.streamIndex, 32);
     SetBool(properties.get(), Keys::kDbcAligned, source.dbcAligned && destination.dbcAligned);
+    SetEntityLayout(properties.get(), caps.entities);
 
     kr = nubService->SetProperties(properties.get());
     if (kr != kIOReturnSuccess) {

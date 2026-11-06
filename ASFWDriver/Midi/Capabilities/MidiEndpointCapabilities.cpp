@@ -113,4 +113,67 @@ MidiEndpointCapabilities ProjectMidiCapabilities(
     return out;
 }
 
+namespace {
+
+/// One direction of a family-declared layout. `pcmSlots` has bit n set when
+/// slot n carries PCM; DBS above 64 cannot be checked and is rejected.
+[[nodiscard]] MidiDirectionCapabilities ProjectDeclaredDirection(
+    const MidiWireLayout& layout, uint8_t ports,
+    const AudioStreamWireInfo& stream, uint64_t pcmSlots) noexcept {
+    MidiDirectionCapabilities out{};
+    if (ports == 0) {
+        out.status = MidiCapabilityStatus::kNoMidi;
+        return out;
+    }
+    if (ports > kMidiPortsPerMpxSlot) {
+        out.status = MidiCapabilityStatus::kPortCountUnsupported;
+        return out;
+    }
+    const uint32_t dbs = stream.am824Slots;
+    if (dbs == 0 || dbs > 64 || dbs != stream.pcmChannels + 1u) {
+        out.status = MidiCapabilityStatus::kGeometryInconsistent;
+        return out;
+    }
+    if (layout.slotIndex >= dbs) {
+        out.status = MidiCapabilityStatus::kSlotOutOfRange;
+        return out;
+    }
+    if ((pcmSlots >> layout.slotIndex) & 1u) {
+        out.status = MidiCapabilityStatus::kSlotOverlapsPcm;
+        return out;
+    }
+    out.status = MidiCapabilityStatus::kOk;
+    out.portCount = ports;
+    out.streamIndex = static_cast<uint8_t>(kMidiStreamIndex);
+    out.midiSlotIndex = layout.slotIndex;
+    out.dbs = static_cast<uint8_t>(dbs);
+    out.pcmChannels = static_cast<uint8_t>(stream.pcmChannels);
+    out.dbcAligned = true;
+    out.format = layout.format;
+    return out;
+}
+
+} // namespace
+
+MidiEndpointCapabilities ProjectDeclaredMidiCapabilities(
+    const MidiWireLayout& layout,
+    const AudioStreamWireInfo& deviceToHost,
+    const AudioStreamWireInfo& hostToDevice,
+    uint64_t pcmSlotsDeviceToHost, uint64_t pcmSlotsHostToDevice,
+    uint64_t guid) noexcept {
+    MidiEndpointCapabilities out{};
+    out.guid = guid;
+    if (!layout.present) {
+        out.deviceToHost.status = MidiCapabilityStatus::kNoMidi;
+        out.hostToDevice.status = MidiCapabilityStatus::kNoMidi;
+        return out;
+    }
+    out.deviceToHost = ProjectDeclaredDirection(layout, layout.sourcePorts, deviceToHost,
+                                                pcmSlotsDeviceToHost);
+    out.hostToDevice = ProjectDeclaredDirection(layout, layout.destinationPorts, hostToDevice,
+                                                pcmSlotsHostToDevice);
+    out.entities = layout.entities;
+    return out;
+}
+
 } // namespace ASFW::Midi

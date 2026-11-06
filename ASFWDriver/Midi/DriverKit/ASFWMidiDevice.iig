@@ -31,12 +31,16 @@ public:
     /// per physical jack pair; asymmetric counts create the side that exists
     /// and omit the one that does not, rather than publishing a phantom
     /// endpoint that would accept bytes with nowhere to send them.
+    /// `entityLayout`, when non-null and non-empty, replaces that positional
+    /// rule: one dictionary per entity with a name, the receive port feeding
+    /// its source and the transmit port its destination writes (0xFF = none).
     virtual bool init(IOUserMIDIDriver* driver,
                       OSString* deviceUID,
                       OSString* modelUID,
                       OSString* manufacturerUID,
                       uint32_t sourcePorts,
-                      uint32_t destinationPorts) LOCALONLY;
+                      uint32_t destinationPorts,
+                      OSArray* entityLayout) LOCALONLY;
 
     virtual void free() override;
 

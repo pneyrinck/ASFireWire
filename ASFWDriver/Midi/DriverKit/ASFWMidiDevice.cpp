@@ -16,6 +16,7 @@
 #include "ASFWMidiDevice.h"
 
 #include "../../Logging/Logging.hpp"
+#include "../Core/MidiNubProperties.hpp"
 #include "../Transport/MidiRxDrain.hpp"
 #include "../Transport/MidiTransportBlock.hpp"
 #include "../Transport/MidiTxIngress.hpp"
@@ -25,6 +26,11 @@ struct ASFWMidiDevice_IVars {
     OSSharedPtr<IODispatchQueue> workQueue;
     uint32_t sourcePorts{0};
     uint32_t destinationPorts{0};
+    // Wire port behind each entity's source / destination, in entity order
+    // (kNoMidiPort = the entity has none). Fixed at init.
+    uint8_t entitySourcePort[ASFW::Midi::kMaxMidiEntities]{};
+    uint8_t entityDestinationPort[ASFW::Midi::kMaxMidiEntities]{};
+    uint32_t entityCount{0};
 
     // The seam. `block` points into memory the endpoint owns and the driver
     // keeps mapped; `bound` is what the I/O blocks check, because an entity's
@@ -89,7 +95,8 @@ bool ASFWMidiDevice::init(IOUserMIDIDriver* driver,
                           OSString* modelUID,
                           OSString* manufacturerUID,
                           uint32_t sourcePorts,
-                          uint32_t destinationPorts) {
+                          uint32_t destinationPorts,
+                          OSArray* entityLayout) {
     if (!super::init(driver, deviceUID, modelUID, manufacturerUID)) {
         return false;
     }
@@ -112,25 +119,62 @@ bool ASFWMidiDevice::init(IOUserMIDIDriver* driver,
     ivars->sourcePorts = sourcePorts;
     ivars->destinationPorts = destinationPorts;
 
-    // One entity per physical jack pair. A device with two inputs and one
-    // output publishes two entities, the second with a source and no
-    // destination -- not a phantom destination whose bytes would go nowhere.
-    const uint32_t entities =
-        sourcePorts > destinationPorts ? sourcePorts : destinationPorts;
+    // The entity table: either the family's layout, or one entity per port
+    // index (n's source reads port n, its destination writes port n). A device
+    // with two inputs and one output publishes two entities, the second with a
+    // source and no destination -- not a phantom destination whose bytes would
+    // go nowhere.
+    struct Planned {
+        OSSharedPtr<OSString> name;
+        uint8_t source;
+        uint8_t destination;
+    };
+    Planned planned[ASFW::Midi::kMaxMidiEntities]{};
+    uint32_t entities = 0;
+    if (entityLayout != nullptr && entityLayout->getCount() > 0) {
+        for (uint32_t i = 0; i < entityLayout->getCount() && entities < ASFW::Midi::kMaxMidiEntities; ++i) {
+            auto* entry = OSDynamicCast(OSDictionary, entityLayout->getObject(i));
+            if (entry == nullptr) continue;
+            auto* name = OSDynamicCast(OSString, entry->getObject(ASFW::Midi::NubKeys::kEntityName));
+            auto* source = OSDynamicCast(OSNumber, entry->getObject(ASFW::Midi::NubKeys::kEntitySourcePort));
+            auto* destination =
+                OSDynamicCast(OSNumber, entry->getObject(ASFW::Midi::NubKeys::kEntityDestinationPort));
+            const uint8_t src = source ? static_cast<uint8_t>(source->unsigned32BitValue())
+                                       : ASFW::Midi::kNoMidiPort;
+            const uint8_t dst = destination ? static_cast<uint8_t>(destination->unsigned32BitValue())
+                                            : ASFW::Midi::kNoMidiPort;
+            planned[entities].name = name ? OSSharedPtr(name, OSRetain) : MakeEntityName(entities + 1);
+            planned[entities].source = src < sourcePorts ? src : ASFW::Midi::kNoMidiPort;
+            planned[entities].destination =
+                dst < destinationPorts ? dst : ASFW::Midi::kNoMidiPort;
+            ++entities;
+        }
+    } else {
+        const uint32_t count = sourcePorts > destinationPorts ? sourcePorts : destinationPorts;
+        for (uint32_t i = 0; i < count && entities < ASFW::Midi::kMaxMidiEntities; ++i) {
+            planned[entities].name = MakeEntityName(i + 1);
+            planned[entities].source =
+                i < sourcePorts ? static_cast<uint8_t>(i) : ASFW::Midi::kNoMidiPort;
+            planned[entities].destination =
+                i < destinationPorts ? static_cast<uint8_t>(i) : ASFW::Midi::kNoMidiPort;
+            ++entities;
+        }
+    }
+
     for (uint32_t i = 0; i < entities; ++i) {
-        const uint32_t sources = (i < sourcePorts) ? 1u : 0u;
-        const uint32_t destinations = (i < destinationPorts) ? 1u : 0u;
-        auto name = MakeEntityName(i + 1);
-        if (!name) {
+        if (!planned[i].name) {
             ASFW_LOG_ERROR(Midi, "ASFWMidiDevice: entity %u name alloc failed", i);
             return false;
         }
+        const uint32_t sources = planned[i].source != ASFW::Midi::kNoMidiPort ? 1u : 0u;
+        const uint32_t destinations =
+            planned[i].destination != ASFW::Midi::kNoMidiPort ? 1u : 0u;
         // MIDIProtocol_1_0: the wire carries a MIDI 1.0 byte stream, so 1.0 is
         // the honest declaration of what reaches the device. Translation to UMP
         // happens at the seam, and claiming 2.0 would promise resolution the
         // hardware cannot carry.
         auto entity = IOUserMIDIEntity::Create(
-            ivars->driver.get(), this, name.get(),
+            ivars->driver.get(), this, planned[i].name.get(),
             IOUserMIDIProtocolID::MIDIProtocol_1_0, sources, destinations);
         if (!entity) {
             ASFW_LOG_ERROR(Midi, "ASFWMidiDevice: entity %u create failed", i);
@@ -141,7 +185,14 @@ bool ASFWMidiDevice::init(IOUserMIDIDriver* driver,
             ASFW_LOG_ERROR(Midi, "ASFWMidiDevice: AddEntity %u failed 0x%x", i, ret);
             return false;
         }
+        ivars->entitySourcePort[i] = planned[i].source;
+        ivars->entityDestinationPort[i] = planned[i].destination;
+        ASFW_LOG(Midi, "ASFWMidiDevice: entity %u '%{public}s' source=%d destination=%d", i,
+                 planned[i].name->getCStringNoCopy(),
+                 planned[i].source == ASFW::Midi::kNoMidiPort ? -1 : planned[i].source,
+                 planned[i].destination == ASFW::Midi::kNoMidiPort ? -1 : planned[i].destination);
     }
+    ivars->entityCount = entities;
 
     // Offline until CoreMIDI opens the device; StartIO clears it.
     auto offline = OSSharedPtr(OSNumber::withNumber(uint64_t{1}, 32), OSNoRetain);
@@ -172,15 +223,18 @@ void ASFWMidiDevice::BindTransport(void* block) {
     // Each destination gets its own port index, captured by value. The block
     // runs on MIDIDriverKit's real-time thread: no allocation, no logging, no
     // locks below this point.
-    __block uint32_t portIndex = 0;
+    __block uint32_t entityIndex = 0;
     auto entities = GetEntities();
     if (!entities) return;
     entities->iterateObjects(^bool(OSObject* object) {
         auto* entity = OSDynamicCast(IOUserMIDIEntity, object);
         if (entity == nullptr) return false;
+        const uint32_t index = entityIndex++;
+        if (index >= ivars->entityCount) return true;
         auto destination = entity->GetDestination(0);
-        if (destination) {
-            const uint32_t port = portIndex;
+        const uint8_t wirePort = ivars->entityDestinationPort[index];
+        if (destination && wirePort != ASFW::Midi::kNoMidiPort) {
+            const uint32_t port = wirePort;
             auto* ivarsCopy = ivars;
             auto ioBlock = ^kern_return_t(IOUserMIDIUMPWord const* umpWords,
                                           size_t numWords) {
@@ -188,7 +242,6 @@ void ASFWMidiDevice::BindTransport(void* block) {
             };
             (void)destination->SetIOBlock(ioBlock);
         }
-        ++portIndex;
         return false;
     });
     ASFW_LOG(Midi, "ASFWMidiDevice: transport bound");
@@ -270,13 +323,15 @@ void ASFWMidiDevice::DrainReceiveRings() {
     auto entities = GetEntities();
     if (!entities) return;
 
-    __block uint32_t portIndex = 0;
+    __block uint32_t entityIndex = 0;
     auto* drain = &ivars->drain;
     entities->iterateObjects(^bool(OSObject* object) {
         auto* entity = OSDynamicCast(IOUserMIDIEntity, object);
         if (entity == nullptr) return false;
-        const uint32_t port = portIndex++;
-        if (port >= ASFW::Midi::kMidiPortsPerDirection) return true;
+        const uint32_t index = entityIndex++;
+        if (index >= ivars->entityCount) return true;
+        const uint32_t port = ivars->entitySourcePort[index];
+        if (port >= ASFW::Midi::kMidiPortsPerDirection) return false;
         auto source = entity->GetSource(0);
         if (!source) return false;
         drain->DrainPort(*block, port, [&](std::span<const ASFW::Midi::Ump::UmpWord> words) {
