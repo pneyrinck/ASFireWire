@@ -364,3 +364,132 @@ TEST(MidiTxComposerNonBlocking, AByteIsRetiredOnlyByAPacketThatCarriesItsPort) {
     for (uint32_t port = 0; port < 8; ++port) EXPECT_EQ(seen[port], 1) << "port " << port;
     EXPECT_EQ(composer.Counters().bytesComposed, 8u);
 }
+
+// ---------------------------------------------------------------------------
+// Digi 002 / 003: at least 500 us between two bytes for one port
+// ---------------------------------------------------------------------------
+
+using ASFW::Encoding::Digi00x::MidiBytePacer;
+
+TEST(Digi00xMidiPacer, TheIntervalIsCountedInBlocksAtTheStreamRate) {
+    MidiBytePacer pacer;
+    pacer.Configure(44100, 500);
+    EXPECT_EQ(pacer.MinBlocks(), 23u);  // 22.05 rounded up
+    pacer.Configure(48000, 500);
+    EXPECT_EQ(pacer.MinBlocks(), 24u);
+    pacer.Configure(96000, 500);
+    EXPECT_EQ(pacer.MinBlocks(), 48u);
+    pacer.Configure(0, 500);
+    EXPECT_EQ(pacer.MinBlocks(), 0u);
+}
+
+TEST(Digi00xMidiPacer, ASecondByteWaitsForTheIntervalFromTheFirstBytesBlock) {
+    // 48 kHz non-blocking: six blocks a packet, DBC 0, 6, 4, 2, 0, ...
+    // Port 0's block is (0 - DBC) mod 8: 0, 2, 4, none, 0.
+    MidiBytePacer pacer;
+    pacer.Configure(48000, 500);
+    ASSERT_TRUE(pacer.AllowedPorts(0, 6) & 1u);
+    pacer.Charge(0, 6, 0);  // byte at block 0
+    pacer.Advance(6);
+    EXPECT_FALSE(pacer.AllowedPorts(6, 6) & 1u);  // block 8: 8 blocks on
+    EXPECT_TRUE(pacer.AllowedPorts(6, 6) & 2u) << "another port is not held";
+    pacer.Advance(6);
+    EXPECT_FALSE(pacer.AllowedPorts(4, 6) & 1u);  // block 16
+    pacer.Advance(6);
+    EXPECT_FALSE(pacer.AllowedPorts(2, 6) & 1u);  // no block for port 0
+    pacer.Advance(6);
+    EXPECT_TRUE(pacer.AllowedPorts(0, 6) & 1u);   // block 24: 500 us on
+}
+
+TEST(Digi00xMidiPacer, ResetLetsTheNextByteGoAtOnce) {
+    MidiBytePacer pacer;
+    pacer.Configure(48000, 500);
+    pacer.Charge(0, 6, 0);
+    pacer.Advance(6);
+    ASSERT_FALSE(pacer.AllowedPorts(6, 6) & 1u);
+    pacer.Reset();
+    EXPECT_TRUE(pacer.AllowedPorts(6, 6) & 1u);
+}
+
+TEST(Digi00xMidiPacer, OffAllowsEveryPort) {
+    // Off is how the composer runs every other wire format, whose ports do not
+    // follow the Digi rotation: nothing may be masked.
+    MidiBytePacer pacer;
+    pacer.Configure(0, 500);
+    pacer.Charge(0, 6, 0);
+    EXPECT_EQ(pacer.AllowedPorts(0, 6), ~0u);
+    EXPECT_EQ(pacer.AllowedPorts(5, 2), ~0u);
+}
+
+namespace {
+
+struct DigiByte {
+    uint64_t block;  // stream position: data blocks before this one
+    uint8_t byte;
+};
+
+// Compose a 40-byte burst for MIDI port 1 into a Digi-format stream and return
+// where each byte landed.
+std::vector<DigiByte> ComposeDigiBurst(uint32_t rate) {
+    ArmedStream stream(rate, StreamMode::NonBlocking);
+    MidiTransportBlock block;
+    block.Arm(1);
+    MidiTxComposer composer;
+    MidiTxComposerConfig config{};
+    config.geometry = MpxMidiGeometry{.dbs = kDbs, .midiSlotIndex = kMidiSlot, .portCount = 3,
+                                      .dbcAligned = true,
+                                      .format = ASFW::Encoding::MidiWireFormat::kDigi00x};
+    config.sampleRateHz = rate;
+    config.sytIntervalFrames = 8;
+    EXPECT_TRUE(composer.Configure(config));
+    composer.Compose(&block, stream.timeline(), 0, 0);  // observe the epoch
+
+    stream.Arm(kSlots - 8);
+    std::vector<uint8_t> burst(40);
+    for (size_t i = 0; i < burst.size(); ++i) burst[i] = static_cast<uint8_t>(0x40 + i);
+    Queue(block, 0, burst);
+    uint64_t frontier = 0;
+    for (int pass = 0; pass < 60; ++pass) {
+        frontier += 8;
+        composer.Compose(&block, stream.timeline(), frontier, stream.armedEnd());
+    }
+
+    std::vector<DigiByte> out;
+    uint64_t position = 0;
+    for (uint64_t p = 0; p < stream.armedEnd(); ++p) {
+        const auto* slot = stream.Slot(p);
+        if (slot == nullptr || !slot->isData) continue;
+        for (uint32_t f = 0; f < slot->framesInPacket; ++f) {
+            const uint32_t q = stream.MidiQuadlet(p, f);
+            EXPECT_EQ(q >> 24, 0x80u);
+            if ((q & 0x0Fu) == 1 && ((q >> 4) & 0x0Fu) == 0x0) {
+                out.push_back({position + f, static_cast<uint8_t>(q >> 16)});
+            }
+        }
+        position += slot->framesInPacket;
+    }
+    return out;
+}
+
+void ExpectPaced(uint32_t rate, uint64_t minBlocks) {
+    const auto bytes = ComposeDigiBurst(rate);
+    ASSERT_EQ(bytes.size(), 40u) << "every byte reaches the wire";
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        EXPECT_EQ(bytes[i].byte, 0x40 + i) << "order at " << i;
+        if (i == 0) continue;
+        const uint64_t gap = bytes[i].block - bytes[i - 1].block;
+        EXPECT_GE(gap, minBlocks) << "bytes " << i - 1 << " and " << i;
+        // Not held longer than needed: within one packet rotation of the limit.
+        EXPECT_LE(gap, minBlocks + 16) << "bytes " << i - 1 << " and " << i;
+    }
+}
+
+} // namespace
+
+TEST(MidiTxComposerDigi00x, BytesForOnePortAreAtLeast500usApartAt48kHz) {
+    ExpectPaced(48000, 24);
+}
+
+TEST(MidiTxComposerDigi00x, BytesForOnePortAreAtLeast500usApartAt44k1) {
+    ExpectPaced(44100, 23);
+}

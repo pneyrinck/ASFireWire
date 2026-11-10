@@ -40,6 +40,8 @@
 //
 // Wire behaviour: Linux write_midi_messages (amdtp-am824.c:295-320) and the
 // first-eight-blocks cap (:28,306); see Audio/Wire/AM824/MpxMidiMux.hpp.
+// The Digi 002 / 003 format is also paced to at least 500 us per byte per
+// port, beyond the UART model; see Audio/Wire/Digi00x/Digi00xMidiPacing.hpp.
 //
 // Pure logic over the timeline and the byte seam: host-testable with real
 // packets built by the production packetizer.
@@ -52,6 +54,7 @@
 
 #include "../../../Wire/AM824/MpxMidiMux.hpp"
 #include "../../../Wire/Digi00x/Digi00xMidi.hpp"
+#include "../../../Wire/Digi00x/Digi00xMidiPacing.hpp"
 #include "../../../Wire/AMDTP/AmdtpPacketTimeline.hpp"
 #include "../../../../Midi/Transport/MidiTransportBlock.hpp"
 #include "../../../../Midi/Transport/MidiTxReservation.hpp"
@@ -105,6 +108,11 @@ public:
         }
         config_ = config;
         scope_.ConfigureLimiter(config.sampleRateHz, config.sytIntervalFrames);
+        // The Digi needs more room between bytes than the UART model gives;
+        // see Digi00xMidiPacing.hpp. Other formats are not paced here.
+        const bool digi = config.geometry.format == ASFW::Encoding::MidiWireFormat::kDigi00x;
+        pacer_.Configure(digi ? config.sampleRateHz : 0,
+                         ASFW::Encoding::Digi00x::kMinMidiByteIntervalUs);
         configured_ = true;
         ResetForRun();
         return true;
@@ -119,6 +127,7 @@ public:
         servedEpoch_ = 0;
         epochKnown_ = false;
         scope_.Reset();
+        pacer_.Reset();
     }
 
     /// Compose one pass over [max(cursor, firstWritable), min(armedEnd,
@@ -142,6 +151,7 @@ public:
             // by its consumer (here), never by the owner.
             for (auto& ring : block->hostToDevice) ring.DiscardBacklog();
             scope_.Reset();
+            pacer_.Reset();
             servedEpoch_ = epoch;
             epochKnown_ = true;
             ++counters_.epochChanges;
@@ -172,6 +182,7 @@ public:
             if (slot->dbs.load(std::memory_order_relaxed) != config_.geometry.dbs ||
                 slot->packetSizeBytes.load(std::memory_order_relaxed) < kCipHeaderBytes + dataBytes) {
                 ++counters_.geometryMismatches;
+                pacer_.Advance(blocks);  // carries no MIDI, but the time passed
                 continue;
             }
 
@@ -180,8 +191,8 @@ public:
             const uint8_t dbc = slot->packetBytes.load(std::memory_order_relaxed)[3];
             ASFW::Midi::MidiPacketReservation reservation{};
             if (!scope_.Begin(*block, epoch, static_cast<uint32_t>(packet), reservation,
-                              PortsInPacket(blocks, dbc))) {
-                break;
+                              PortsInPacket(blocks, dbc) & pacer_.AllowedPorts(dbc, blocks))) {
+                break;  // this packet is retried by the next pass: no Advance
             }
             if (reservation.Any()) {
                 ASFW::Encoding::MpxMidiPacketBytes bytes{};
@@ -199,12 +210,15 @@ public:
                                                      bytes);
                 }
                 for (uint32_t port = 0; port < ASFW::Encoding::kMpxMidiPorts; ++port) {
-                    if (bytes.hasByteForPort[port]) ++result.bytesComposed;
+                    if (!bytes.hasByteForPort[port]) continue;
+                    ++result.bytesComposed;
+                    pacer_.Charge(dbc, blocks, port);
                 }
                 ++result.packetsComposed;
             }
             // The bytes are in the packet image. Retire them from the rings.
             (void)scope_.Commit(*block, reservation);
+            pacer_.Advance(blocks);
         }
         cursor_ = packet;
 
@@ -238,6 +252,7 @@ private:
     uint64_t servedEpoch_{0};
     bool epochKnown_{false};
     ASFW::Midi::MidiTxReservationScope scope_{};
+    ASFW::Encoding::Digi00x::MidiBytePacer pacer_{};
     MidiTxComposerCounters counters_{};
 };
 
